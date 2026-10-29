@@ -1,0 +1,26 @@
+spring:
+  application:
+    name: springAI
+  profiles:
+    include: secret  # 会自动加载名为 application-secret.yaml 的文件
+  ai:
+    openai:
+      # DeepSeek 官方 API Base URL
+      base-url: https://api.deepseek.com
+      # 替换为你的 DeepSeek API Key，严禁外泄
+      api-key: ${DEEPSEEK_API_KEY}
+      chat:
+        model: deepseek-flash  # 模型名称
+        temperature: 0.7  # 值越大，输出的结果越随机
+
+    # 启用相关自动配置，通常会自动提供 ChatClient.Builder，供你构建 ChatClient
+    chat:
+      client:
+        enabled: true # 默认 true
+
+          
+logging:
+  level:
+    # 在特定的包下开启特定级别的日志，通常 debug 级别的日志会被忽略
+    org.springframework.ai.chat.client.advisor: debug
+    com.myself.springai: debug
