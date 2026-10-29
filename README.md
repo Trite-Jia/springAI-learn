@@ -690,9 +690,366 @@ BookInfo book = chatClient.prompt()
 
 本版本尚未实现对话历史持久化、工具调用和知识库检索。这些能力将在后续版本中逐步学习和扩展。
 
+# v0.3：工具调用（Tool Calling / Function Calling）
+
+本版本在 v0.2 的基础上，学习 Spring AI 2 的**工具调用**能力：
+
+- 让大模型在回答问题时，能够**调用我们自己编写的 Java 方法**（工具），例如查询订单状态、查询天气、获取当前时间、生成随机数等。
+- 学习定义工具的**两种方式**：`@Tool` 注解方式 与 `FunctionToolCallback` 函数式方式。
+- 学习如何把工具**注册**到 `ChatClient`。
+- 理解工具调用背后的**实现机制**：Java 方法如何被描述给大模型、大模型如何“请求调用工具”、Spring AI 如何执行工具并回传结果。
+
+本版本新增接口：
+
+| 接口 | 作用 |
+|---|---|
+| `/ai/tools` | 工具调用演示，用户用自然语言提问，模型自行判断是否调用工具 |
+| `/ai/tools/definitions` | 查看已注册工具的名称、描述和 JSON Schema |
+
+---
+
+## 一、什么是工具调用？
+
+在 v0.1、v0.2 中，大模型只能基于**它自己训练时学到的知识**来回答。例如，用户问“帮我查一下订单 A1001 的物流”，大模型并不知道你的订单系统里 A1001 到底是什么状态。
+
+工具调用（Tool Calling，也叫 Function Calling）解决的问题是：
+
+> **让大模型在需要时，调用我们提供的函数来获取实时、准确的数据，再基于这些数据作答。**
+
+整个过程可以理解为：
+
+```text
+用户：帮我查一下订单 A1001 的状态
+        ↓
+大模型：这个问题需要用到“查询订单”这个工具
+        ↓
+大模型：返回一个“工具调用”请求（工具名 getOrderStatus，参数 orderId=A1001）
+        ↓
+Spring AI：代大模型执行 getOrderStatus("A1001")，得到“已发货，顺丰 SF1234567890”
+        ↓
+Spring AI：把执行结果回传给大模型
+        ↓
+大模型：基于结果生成最终回答“订单 A1001 已经发货，顺丰单号 SF1234567890”
+```
+
+关键点：**大模型并不直接执行你的 Java 方法**。它只负责“决定调用哪个工具、传什么参数”，真正执行方法的是运行在你自己服务器上的 Spring AI 应用。
+
+---
+
+## 二、定义工具的两种方式
+
+Spring AI 2 提供了多种定义工具的方式，本版本演示其中最常用的两种。
+
+### 2.1 方式一：@Tool 注解方式（推荐）
+
+给一个普通方法加上 `@Tool` 注解，方法的参数用 `@ToolParam` 描述，就可以把方法变成工具。
+
+`Tools.java`：
+
+```java
+@Component
+public class Tools {
+
+    // 模拟订单数据库
+    private static final Map<String, String> ORDERS = Map.of(
+            "A1001", "已发货，顺丰 SF1234567890",
+            "A1002", "待支付，30 分钟后自动取消"
+    );
+
+    @Tool(description = "根据订单号查询订单状态和物流信息")
+    public String getOrderStatus(@ToolParam(description = "订单号，格式如 A1001") String orderId) {
+        return ORDERS.getOrDefault(orderId, "订单号不存在");
+    }
+
+    @Tool(description = "查询指定城市的天气，温度单位可选摄氏度或华氏度")
+    public String getWeather(
+            @ToolParam(description = "城市名称，例如：北京") String city,
+            @ToolParam(description = "温度单位，celsius 表示摄氏度，fahrenheit 表示华氏度") String unit) {
+        String temperature = "celsius".equalsIgnoreCase(unit) ? "25℃" : "77℉";
+        return city + "今天晴，气温 " + temperature + "，适合出行";
+    }
+
+    @Tool(description = "获取当前的日期和时间")
+    public String getCurrentTime() {
+        return "当前时间为：" + LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
+    }
+}
+```
+
+说明：
+
+- `@Tool(description = "...")`：工具的描述，**这是给大模型看的**。描述越清晰，模型越容易判断什么时候该用这个工具。
+- `@ToolParam(description = "...")`：参数的描述，同样用于帮助模型理解参数含义。
+- 方法的返回值（这里是 `String`）会作为工具执行结果回传给大模型。
+
+### 2.2 方式二：FunctionToolCallback 函数式方式
+
+当工具逻辑很简单，或想脱离 Spring Bean 直接用一个 Lambda 定义工具时，可以使用 `FunctionToolCallback`。
+
+`ToolCallbackConfig.java`：
+
+```java
+@Configuration
+public class ToolCallbackConfig {
+
+    // 工具入参的 Java 类型，Spring AI 会根据它生成 JSON Schema
+    public record RandomNumberRequest(int min, int max) {}
+
+    @Bean
+    public ToolCallback randomNumberTool() {
+        return FunctionToolCallback
+                .builder("randomNumber", (RandomNumberRequest request) -> {
+                    int value = ThreadLocalRandom.current().nextInt(request.min(), request.max() + 1);
+                    return "在 [" + request.min() + ", " + request.max() + "] 之间的随机整数是：" + value;
+                })
+                .description("在指定范围内生成一个随机整数，min 为最小值，max 为最大值")
+                .inputType(RandomNumberRequest.class)
+                .build();
+    }
+}
+```
+
+说明：
+
+- `FunctionToolCallback.builder("randomNumber", 函数)`：第一个参数是工具名，第二个参数是函数实现（一个 Lambda）。
+- `.description(...)`：工具描述。
+- `.inputType(RandomNumberRequest.class)`：指定入参类型，Spring AI 会根据这个类型自动生成 JSON Schema。
+- 最后 `.build()` 返回一个 `ToolCallback`，并注册成 Spring Bean。
+
+### 2.3 两种方式的对比
+
+| 对比项 | @Tool 注解方式 | FunctionToolCallback 方式 |
+|---|---|---|
+| 定义位置 | Spring Bean 上的方法 | 任意 Lambda / 函数对象 |
+| 参数描述 | `@ToolParam` 注解 | 通过入参类型 + `description` |
+| 适用场景 | 方法较多、有业务逻辑、需要依赖注入 | 逻辑简单、想快速定义一个函数 |
+| 可读性 | 更接近普通 Java 方法，推荐 | 更紧凑 |
+
+两种方式最终都会转换成统一的 `ToolCallback` 接口，Spring AI 对它们一视同仁。
+
+---
+
+## 三、注册工具
+
+工具定义好之后，需要注册到 `ChatClient`，大模型才知道有哪些工具可用。
+
+`ChatController.java`：
+
+```java
+public ChatController(ChatClient.Builder builder, Tools tools, ToolCallback randomNumberTool) {
+    this.chatClient = builder
+            // defaultTools(...) 是统一的工具注册方法，可以混用不同方式定义的工具
+            .defaultTools(tools, randomNumberTool)
+            .build();
+}
+```
+
+注册 API：
+
+| API | 作用 |
+|---|---|
+| `defaultTools(Object...)` | Spring AI 2 的统一工具注册方法，可同时接收 `@Tool` 注解对象、`ToolCallback`、`ToolCallbackProvider` |
+
+`defaultTools` 表示这些工具作为**默认工具**注册，之后每次调用 `chatClient` 都会携带这些工具定义。如果需要针对某一次请求临时注册工具，可以使用 `prompt().tools(...)`。
+
+> 注意：早期版本用 `defaultToolCallbacks(ToolCallback...)` 单独注册 `ToolCallback`，该方法在 Spring AI 2.0 中已经**废弃**。现在无论哪种方式定义的工具，都统一通过 `defaultTools(...)` / `tools(...)` 注册。
+
+---
+
+## 四、运行与测试
+
+启动应用后，访问工具调用接口：
+
+```text
+http://localhost:8080/ai/tools?query=帮我查一下订单 A1001 的状态
+```
+
+模型会判断需要调用 `getOrderStatus` 工具，最终返回类似：
+
+```text
+订单 A1001 已经发货，物流单号是顺丰 SF1234567890。
+```
+
+更多测试示例：
+
+| 请求 query | 预期触发的工具 |
+|---|---|
+| 帮我查一下订单 A1001 的状态 | getOrderStatus |
+| 北京今天天气怎么样？用摄氏度 | getWeather |
+| 现在几点了？ | getCurrentTime |
+| 生成一个 1 到 100 之间的随机整数 | randomNumber |
+
+查看已注册工具的定义（名称、描述、JSON Schema）：
+
+```text
+http://localhost:8080/ai/tools/definitions
+```
+
+> 注意：工具调用需要大模型**支持 Function Calling**。DeepSeek 的 `deepseek-chat` 支持工具调用；如果当前使用的 `deepseek-flash` 模型不支持，可以尝试在 `application.yml` 中把 `spring.ai.openai.chat.model` 改为 `deepseek-chat`。
+
+---
+
+## 五、实现机制详解
+
+### 5.1 从 Java 方法到 JSON Schema
+
+大模型本身不认识 Java 方法。Spring AI 需要先通过反射，把工具方法“翻译”成大模型能理解的描述，也就是 **JSON Schema**。
+
+以 `getOrderStatus(String orderId)` 为例，Spring AI 通过读取 `@Tool` / `@ToolParam` 注解以及方法签名，生成类似这样的工具定义：
+
+```json
+{
+  "name": "getOrderStatus",
+  "description": "根据订单号查询订单状态和物流信息",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "orderId": {
+        "type": "string",
+        "description": "订单号，格式如 A1001"
+      }
+    },
+    "required": ["orderId"]
+  }
+}
+```
+
+其中：
+
+- `name` 默认取方法名；
+- `description` 来自 `@Tool(description = ...)`；
+- `inputSchema` 根据方法参数自动生成：参数名作为属性名，参数类型对应 schema 的 `type`，`@ToolParam` 的 `description` 会填进去。
+
+对于 `FunctionToolCallback`，`inputSchema` 则是根据 `.inputType(...)` 指定的 Java 类型生成。
+
+### 5.2 工具调用的完整过程
+
+一次完整的工具调用，大致经历以下步骤（以 OpenAI 兼容接口为例）：
+
+```text
+1. 发送请求（带上 tools）
+   ChatClient.prompt().user(query).call()
+        ↓
+   请求体包含：
+   - messages：用户消息
+   - tools：所有注册工具的名称、描述、JSON Schema
+        ↓
+2. 模型返回“工具调用”而不是最终回答
+   模型判断需要工具，返回：
+   - tool_calls：[{ name: "getOrderStatus", arguments: {"orderId": "A1001"} }]
+        ↓
+3. Spring AI 执行真正的 Java 方法
+   根据 tool_calls 找到对应的 ToolCallback，
+   反序列化参数，反射调用 getOrderStatus("A1001")
+   得到返回字符串 "已发货，顺丰 SF1234567890"
+        ↓
+4. 把执行结果回传给模型
+   将结果作为一条 role=tool 的消息追加到对话，
+   再次请求模型
+        ↓
+5. 模型基于工具结果生成最终回答
+   "订单 A1001 已经发货，顺丰单号 SF1234567890"
+```
+
+### 5.3 请求与响应的概念示意
+
+**第一步：请求大模型时，请求体里除了 messages，还带上 tools 定义**
+
+```json
+{
+  "model": "deepseek-chat",
+  "messages": [
+    { "role": "user", "content": "帮我查一下订单 A1001 的状态" }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "getOrderStatus",
+        "description": "根据订单号查询订单状态和物流信息",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "orderId": { "type": "string", "description": "订单号，格式如 A1001" }
+          },
+          "required": ["orderId"]
+        }
+      }
+    }
+  ]
+}
+```
+
+**第二步：模型没有直接输出答案，而是返回 tool_calls**
+
+```json
+{
+  "choices": [
+    {
+      "message": {
+        "role": "assistant",
+        "content": null,
+        "tool_calls": [
+          {
+            "id": "call_123",
+            "type": "function",
+            "function": {
+              "name": "getOrderStatus",
+              "arguments": "{\"orderId\": \"A1001\"}"
+            }
+          }
+        ]
+      }
+    }
+  ]
+}
+```
+
+**第三步：Spring AI 执行方法后，把结果作为 role=tool 消息再次发给模型**
+
+```json
+{
+  "messages": [
+    { "role": "user", "content": "帮我查一下订单 A1001 的状态" },
+    { "role": "assistant", "tool_calls": [ "..." ] },
+    { "role": "tool", "tool_call_id": "call_123", "content": "已发货，顺丰 SF1234567890" }
+  ]
+}
+```
+
+**第四步：模型基于工具结果生成最终自然语言回答。**
+
+### 5.4 Spring AI 内部的关键角色
+
+| 类 / 接口 | 作用 |
+|---|---|
+| `ToolCallback` | 工具的统一抽象，负责提供工具定义并执行工具调用 |
+| `MethodToolCallback` | `@Tool` 注解方法的工具回调，通过反射调用方法 |
+| `FunctionToolCallback` | 基于函数 / Lambda 的工具回调 |
+| `ToolDefinition` | 工具元信息：`name`、`description`、`inputSchema` |
+| `ToolCallingAdvisor` | 请求级处理器，负责检测 `tool_calls`、执行工具、回传结果 |
+
+说明：以上是 Spring AI 2 中工具调用相关的主要组件。具体类名和内部实现可能随版本变化，学习时以当前依赖版本为准。
+
+> 关键结论：**工具调用不是大模型“调用”了你的方法，而是大模型“建议”调用，由应用端真正执行，再把结果喂回大模型。**
+
+---
+
+## 六、核心 API 总结
+
+| 功能 | 核心 API | 作用 |
+|---|---|---|
+| 注解定义工具 | `@Tool` / `@ToolParam` | 把普通方法标注为工具 |
+| 函数式定义工具 | `FunctionToolCallback.builder(...)` | 用 Lambda 构造工具 |
+| 注册默认工具 | `defaultTools(...)` | 统一注册 `@Tool` 对象 / `ToolCallback` / `ToolCallbackProvider` |
+| 查看工具定义 | `ToolCallback.getToolDefinition()` | 获取工具名称、描述、JSON Schema |
+
+通过 v0.3，我们学会了让大模型“学会使用我们的方法”，这是构建 AI Agent（智能体）的基础能力——Agent 的核心就是“模型 + 工具 + 循环”。
+
 ---
 
 **版本记录**
 
 - v0.1：基础大模型调用，使用 `ChatClient` 完成普通问答。
 - v0.2：流式输出、System Prompt、提示词模板参数、结构化输出。
+- v0.3：工具调用（Tool Calling），@Tool 注解与 FunctionToolCallback 两种定义方式，以及实现机制。
