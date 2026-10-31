@@ -1046,6 +1046,236 @@ http://localhost:8080/ai/tools/definitions
 
 通过 v0.3，我们学会了让大模型“学会使用我们的方法”，这是构建 AI Agent（智能体）的基础能力——Agent 的核心就是“模型 + 工具 + 循环”。
 
+# v0.4：对话记忆（Chat Memory 窗口）
+
+本版本在 v0.3 的基础上，学习 Spring AI 2 的**对话记忆**能力：
+
+- 让大模型“记住”同一会话里的聊天历史，实现多轮对话。
+- 使用**窗口式**记忆 `MessageWindowChatMemory`，只保留最近的 N 条消息，避免上下文无限增长。
+- 通过 `MessageChatMemoryAdvisor` 自动在请求前后读写记忆。
+- 理解对话记忆背后的**实现原理**：Advisor 机制、会话隔离、滑动窗口。
+
+本版本新增接口：
+
+| 接口 | 作用 |
+|---|---|
+| `/ai/chat/memory` | 对话记忆演示，通过 conversationId 区分不同会话 |
+
+---
+
+## 一、为什么需要对话记忆？
+
+回想 v0.1 的 `/ai/chat` 接口，每次请求都是**独立**的：
+
+```text
+第 1 次问：我叫小明
+        ↓
+大模型：你好，小明！
+        ↓
+第 2 次问：我叫什么名字？
+        ↓
+大模型：我不知道你叫什么名字（因为这次请求里没有"我叫小明"这句话）
+```
+
+这就是大模型的**无状态**特性：它每次只看到“当前这一条消息”，看不到之前的对话。
+
+对话记忆（Chat Memory）解决的问题是：
+
+> **把之前的聊天记录保存下来，每次提问时把历史一起发给大模型，让它“记得”上下文。**
+
+加上记忆后：
+
+```text
+第 1 次问：我叫小明
+        ↓
+大模型：你好，小明！
+        ↓
+（把"我叫小明 + 你好小明"存进记忆）
+        ↓
+第 2 次问：我叫什么名字？
+        ↓
+（自动把历史"我叫小明 / 你好小明"拼到本次请求里）
+        ↓
+大模型：你叫小明。
+```
+
+---
+
+## 二、核心组件
+
+Spring AI 2 用两个组件配合实现对话记忆：
+
+| 组件 | 作用 |
+|---|---|
+| `ChatMemory` | 记忆的“仓库”，负责保存、读取、清除历史消息 |
+| `MessageChatMemoryAdvisor` | 记忆的“搬运工”，请求前自动读取历史、响应后自动保存新消息 |
+
+其中 `ChatMemory` 有多种实现，本版本使用**窗口式**实现：
+
+- `MessageWindowChatMemory`：只保留每个会话最近的 N 条消息（滑动窗口），超出的旧消息自动丢弃。
+
+这样既记住了上下文，又避免对话越来越长、消耗越来越多的 token。
+
+---
+
+## 三、代码实现
+
+### 3.1 定义记忆（ChatMemoryConfig.java）
+
+```java
+@Configuration
+public class ChatMemoryConfig {
+
+    // 窗口式记忆：每个会话只保留最近 10 条消息
+    @Bean
+    public ChatMemory chatMemory() {
+        return MessageWindowChatMemory.builder()
+                .maxMessages(10)   // 窗口大小：10 条消息（约 5 轮问答），默认是 20
+                .build();
+    }
+
+    // 记忆顾问：请求前读历史、响应后存新消息
+    @Bean
+    public MessageChatMemoryAdvisor chatMemoryAdvisor(ChatMemory chatMemory) {
+        return MessageChatMemoryAdvisor.builder(chatMemory).build();
+    }
+}
+```
+
+说明：
+
+- `MessageWindowChatMemory.builder().maxMessages(10).build()` 创建一个窗口大小为 10 的记忆，底层默认用内存存储（`InMemoryChatMemoryRepository`）。
+- `MessageChatMemoryAdvisor.builder(chatMemory).build()` 创建记忆顾问，它持有上面的记忆仓库。
+
+### 3.2 使用记忆（ChatController.java 新增接口）
+
+```java
+@GetMapping("/chat/memory")
+public String chatWithMemory(@RequestParam String prompt, @RequestParam String conversationId) {
+    return chatClient.prompt()
+            .user(prompt)
+            // 在"本次请求"上启用记忆 advisor，并指定会话 ID
+            .advisors(a -> a
+                    .advisors(chatMemoryAdvisor)
+                    .param(ChatMemory.CONVERSATION_ID, conversationId))
+            .call()
+            .content();
+}
+```
+
+说明：
+
+- `conversationId` 用来区分不同会话，同一个 ID 共享一份记忆。
+- `.advisors(a -> a.advisors(chatMemoryAdvisor))` 把记忆顾问加进**本次请求**。
+- `.param(ChatMemory.CONVERSATION_ID, conversationId)` 告诉顾问“这次是哪个会话”。
+- 之所以**每次请求临时添加**顾问，而不是在 `ChatClient` 上全局注册，是为了不影响 `/ai/chat`、`/ai/issue` 等不需要记忆的接口。
+
+---
+
+## 四、运行与测试
+
+启动应用后，用**同一个 conversationId** 连续提问，观察模型是否记得上下文：
+
+**第一轮**：
+
+```text
+http://localhost:8080/ai/chat/memory?conversationId=001&prompt=我叫小明，我是一名Java程序员
+```
+
+**第二轮（重点看是否记住）**：
+
+```text
+http://localhost:8080/ai/chat/memory?conversationId=001&prompt=我叫什么名字？我的职业是什么？
+```
+
+模型应能回答出“你叫小明，职业是 Java 程序员”。
+
+**换一个会话 ID，验证隔离**：
+
+```text
+http://localhost:8080/ai/chat/memory?conversationId=002&prompt=我叫什么名字？
+```
+
+因为 conversationId=002 是全新会话，模型不知道小明是谁。
+
+> 小技巧：换一个从未用过的 conversationId，就等于“开一个新对话”。
+
+---
+
+## 五、实现原理
+
+### 5.1 Advisor 是什么？
+
+在 Spring AI 中，`Advisor`（顾问）是一个**请求处理器**，它包裹在“真正调用大模型”的外层，可以在两个时机插入逻辑：
+
+- **请求前（before）**：修改要发给大模型的请求（例如往里面塞历史消息）。
+- **响应后（after）**：处理大模型返回的结果（例如把新对话存起来）。
+
+`MessageChatMemoryAdvisor` 就是这样一个顾问，可以把它理解成对话记忆的“搬运工”。
+
+### 5.2 带记忆的完整请求流程
+
+```text
+用户：/ai/chat/memory?conversationId=001&prompt=我叫什么名字？
+        ↓
+MessageChatMemoryAdvisor（请求前）
+  从 ChatMemory 取出 conversationId=001 的历史：
+  [用户："我叫小明"，模型："你好，小明！"]
+        ↓
+把历史和本次问题拼在一起，发给大模型：
+  [用户："我叫小明", 模型："你好小明", 用户："我叫什么名字？"]
+        ↓
+大模型基于完整上下文生成回答："你叫小明。"
+        ↓
+MessageChatMemoryAdvisor（响应后）
+  把本次的"用户问题 + 模型回答"追加进 ChatMemory
+        ↓
+返回"你叫小明。"给用户
+```
+
+关键点：**大模型本身还是无状态的，只是每次都把历史“重放”了一遍。** 记忆不是大模型自己记的，而是应用端帮它记、再喂给它的。
+
+### 5.3 会话隔离：conversationId
+
+`ChatMemory` 是一个以 `conversationId` 为键的“字典”：
+
+```text
+conversationId=001  ->  [消息1, 消息2, 消息3, ...]
+conversationId=002  ->  [消息1, 消息2, ...]
+conversationId=003  ->  []
+```
+
+不同的 conversationId 各存各的历史，互不干扰。这正是“多用户 / 多会话”场景的基础。
+
+### 5.4 滑动窗口：为什么只保留最近 N 条
+
+如果不做限制，对话历史会无限增长：聊得越久，每次请求携带的历史越多，token 消耗和费用也越高。
+
+`MessageWindowChatMemory` 采用**滑动窗口**策略：
+
+```text
+窗口大小 = 10 条消息
+
+历史：[1][2][3][4][5][6][7][8][9][10]
+                    ↓ 又来一轮新消息
+结果：[3][4][5][6][7][8][9][10][11][12]   （最旧的 1、2 被挤出去）
+```
+
+这样窗口内的消息始终不超过 10 条。代价是：**太久之前的对话会被遗忘**。窗口越大记得越久、越费 token；窗口越小越省、但忘得越快，需要根据业务权衡。
+
+---
+
+## 六、核心 API 总结
+
+| 功能 | 核心 API | 作用 |
+|---|---|---|
+| 窗口式记忆 | `MessageWindowChatMemory.builder().maxMessages(n).build()` | 创建只保留最近 n 条消息的记忆 |
+| 记忆顾问 | `MessageChatMemoryAdvisor.builder(chatMemory).build()` | 请求前后自动读写记忆 |
+| 指定会话 | `.advisors(a -> a.param(ChatMemory.CONVERSATION_ID, id))` | 告诉顾问本次请求属于哪个会话 |
+| 临时启用顾问 | `.advisors(a -> a.advisors(chatMemoryAdvisor))` | 只在某次请求里加顾问 |
+
+通过 v0.4，我们让大模型拥有了“记住对话”的能力。对话记忆 + 工具调用，是构建一个真正可用的 AI 聊天机器人 / 智能体的两块重要基石。
+
 ---
 
 **版本记录**
@@ -1053,3 +1283,4 @@ http://localhost:8080/ai/tools/definitions
 - v0.1：基础大模型调用，使用 `ChatClient` 完成普通问答。
 - v0.2：流式输出、System Prompt、提示词模板参数、结构化输出。
 - v0.3：工具调用（Tool Calling），@Tool 注解与 FunctionToolCallback 两种定义方式，以及实现机制。
+- v0.4：对话记忆（Chat Memory 窗口），MessageWindowChatMemory + MessageChatMemoryAdvisor，以及实现原理。

@@ -4,6 +4,8 @@ import com.myself.springai.tools.Tools;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.chat.client.advisor.MessageChatMemoryAdvisor;
+import org.springframework.ai.chat.memory.ChatMemory;
 import org.springframework.ai.tool.ToolCallback;
 import org.springframework.ai.tool.definition.ToolDefinition;
 import org.springframework.ai.tool.method.MethodToolCallbackProvider;
@@ -31,13 +33,19 @@ public class ChatController {
     private final Tools tools;
     private final ToolCallback randomNumberTool;
 
+    // 对话记忆顾问，用于让大模型记住同一会话下的聊天历史。
+    private final MessageChatMemoryAdvisor chatMemoryAdvisor;
+
     // 构造方法注入：
     // - ChatClient.Builder：Spring AI 自动配置提供的 ChatClient 构建器；
     // - Tools：我们自定义的 @Tool 注解工具类；
-    // - ToolCallback：用 FunctionToolCallback 定义的工具 Bean。
-    public ChatController(ChatClient.Builder builder, Tools tools, ToolCallback randomNumberTool) {
+    // - ToolCallback：用 FunctionToolCallback 定义的工具 Bean；
+    // - MessageChatMemoryAdvisor：对话记忆顾问，让大模型记住聊天历史。
+    public ChatController(ChatClient.Builder builder, Tools tools, ToolCallback randomNumberTool,
+            MessageChatMemoryAdvisor chatMemoryAdvisor) {
         this.tools = tools;
         this.randomNumberTool = randomNumberTool;
+        this.chatMemoryAdvisor = chatMemoryAdvisor;
 
         this.chatClient = builder
                 // defaultTools(...) 是 Spring AI 2 中统一的工具注册方法，
@@ -149,6 +157,27 @@ public class ChatController {
                     return new ToolInfo(def.name(), def.description(), def.inputSchema());
                 })
                 .toList();
+    }
+
+    /**
+     * 对话记忆演示接口。
+     *
+     * 通过 conversationId 区分不同的会话：同一个 conversationId 下的多轮提问，
+     * 大模型会"记得"之前聊过的内容；不同的 conversationId 之间互不干扰。
+     */
+    @GetMapping("/chat/memory")
+    public String chatWithMemory(@RequestParam String prompt, @RequestParam String conversationId) {
+        log.info("/chat/memory，conversationId={}，prompt={}", conversationId, prompt);
+        return chatClient.prompt()
+                .user(prompt)
+                // 在"本次请求"上启用记忆 advisor，并指定会话 ID。
+                // 之所以每次请求临时添加，而不是 defaultAdvisors 全局注册，
+                // 是为了不影响 /chat、/issue 等不需要记忆的接口。
+                .advisors(a -> a
+                        .advisors(chatMemoryAdvisor)
+                        .param(ChatMemory.CONVERSATION_ID, conversationId))
+                .call()
+                .content();
     }
 
     // 返回给前端的工具信息
