@@ -1278,9 +1278,272 @@ conversationId=003  ->  []
 
 ---
 
+# v0.5：嵌入模型（Embedding Model）
+
+本版本在 v0.4 的基础上，学习 Spring AI 2 的**嵌入模型（Embedding）**能力：
+
+- 使用阿里云百炼的 `qwen3.7-text-embedding` 模型（维度 **2048**）把三句话转换成向量。
+- 计算三句话两两之间的**余弦相似度**，直观比较它们语义上的“远近”。
+- 理解嵌入模型的**原理**与**用途**（语义搜索、RAG、推荐等）。
+
+本版本新增接口：
+
+| 接口 | 作用 |
+|---|---|
+| `/ai/embedding/similarity` | 把三句话向量化，并计算两两之间的余弦相似度 |
+
+---
+
+## 一、什么是嵌入模型（Embedding）？
+
+大模型本质上是处理“文字”的，但计算机做数学运算需要的是“数字”。**嵌入模型（Embedding Model）**的作用，就是把一段文字转换成一组数字，这组数字叫做**向量（vector）**：
+
+```text
+"我喜欢吃苹果"        →  [0.02, -0.15, 0.31, 0.08, ... , 0.12]   （共 2048 个数字）
+"苹果是我最喜欢的水果" →  [0.03, -0.14, 0.29, 0.09, ... , 0.11]   （共 2048 个数字）
+"今天天气很好"        →  [-0.20, 0.41, -0.05, -0.33, ... , 0.02]（共 2048 个数字）
+```
+
+关键规律：
+
+> **语义越相近的文本，它们对应的向量在空间中方向越接近、距离越近。**
+
+上面前两句都在说“苹果”，所以它们的向量很接近；第三句在说“天气”，向量就和前两句离得很远。
+
+嵌入模型的典型用途：
+
+- **语义搜索**：把问题和文档都向量化，找“意思最接近”的文档（而不是只按关键词匹配）。
+- **RAG（检索增强生成）**：先从知识库里检索相关片段，再喂给大模型回答。
+- **文本聚类 / 分类**：把语义相近的文本自动聚成一类。
+- **推荐系统**：找“和用户感兴趣的内容相似”的其他内容。
+
+---
+
+## 二、核心概念
+
+| 概念 | 说明 |
+|---|---|
+| 向量（vector） | 一串定长的数字，例如 2048 个 `float` |
+| 维度（dimension） | 向量的长度，本版本为 2048 |
+| 余弦相似度 | 衡量两个向量**方向**是否接近，值约 0~1，越大越相似 |
+| 余弦距离 | = `1 - 余弦相似度`，越大表示语义离得越远 |
+
+为什么用“余弦相似度”而不是直接比“两点距离”？
+
+- 文本转成的向量往往**长度不一**，而**方向**更能反映语义。余弦相似度只看“夹角”、不看“长度”，更适合比较文本语义。
+
+---
+
+## 三、配置说明
+
+一个很容易忽略、但很重要的点：
+
+> **chat（对话）和 embedding（嵌入）是两个相互独立的模型，它们可以指向完全不同的服务商。**
+
+本项目中：
+
+- 对话模型：DeepSeek（`spring.ai.openai.chat`）
+- 嵌入模型：阿里云百炼 `qwen3.7-text-embedding`（`spring.ai.openai.embedding`）
+
+因为 `spring-ai-starter-model-openai` 走的是 OpenAI 兼容协议，而阿里云百炼（DashScope）提供了 OpenAI 兼容接口，所以直接复用同一套 starter 即可。
+
+`application.yml` 中的相关配置：
+
+```yaml
+spring:
+  ai:
+    openai:
+      # 对话模型：DeepSeek
+      base-url: https://api.deepseek.com
+      api-key: ${DEEPSEEK_API_KEY}
+      chat:
+        model: deepseek-flash
+        temperature: 0.7
+
+      # 嵌入模型：阿里云百炼 text-embedding-v4（OpenAI 兼容接口）
+      embedding:
+        base-url: https://dashscope.aliyuncs.com/compatible-mode/v1
+        api-key: ${DASHSCOPE_API_KEY}
+        model: qwen3.7-text-embedding
+        dimensions: 2048
+```
+
+说明：
+
+- `spring.ai.openai.embedding.base-url` / `api-key` 会**覆盖**上面通用的 `base-url` / `api-key`，所以 chat 和 embedding 可以各用各的。
+- `model: qwen3.7-text-embedding`：阿里云百炼的嵌入模型。
+- `dimensions: 2048`：向量维度。`qwen3.7-text-embedding` 支持 `2048 / 1536 / 1024 / 768 / 512 / 256 / 128 / 64`（默认 1024）。
+- `DASHSCOPE_API_KEY` 需要在 `application-secret.yaml` 中填写你自己的百炼 API Key（去 [阿里云百炼控制台](https://bailian.console.aliyun.com) 开通获取）。
+
+---
+
+## 四、代码实现
+
+本版本新增 `EmbeddingController.java`，核心逻辑只有三步：**向量化 → 算相似度 → 返回结果**。
+
+### 4.1 注入 EmbeddingModel
+
+```java
+@RestController
+@RequestMapping("/ai/embedding")
+public class EmbeddingController {
+
+    // Spring AI 提供的嵌入模型抽象，配置好后自动注入对应实现
+    private final EmbeddingModel embeddingModel;
+
+    public EmbeddingController(EmbeddingModel embeddingModel) {
+        this.embeddingModel = embeddingModel;
+    }
+    // ...
+}
+```
+
+`EmbeddingModel` 是 Spring AI 对“嵌入模型”的统一抽象接口，屏蔽了不同厂商的差异——你只管调用，不用关心底层是 OpenAI 还是阿里云百炼。
+
+### 4.2 向量化 + 计算相似度
+
+```java
+@GetMapping("/similarity")
+public SimilarityResult similarity(
+        @RequestParam(defaultValue = "我喜欢吃苹果") String text1,
+        @RequestParam(defaultValue = "苹果是我最喜欢的水果") String text2,
+        @RequestParam(defaultValue = "今天天气很好") String text3) {
+
+    // 1. 一次性把三句话交给嵌入模型，得到三个向量（float[]）
+    List<float[]> vectors = embeddingModel.embed(List.of(text1, text2, text3));
+
+    // 2. 计算两两之间的余弦相似度（约 0~1，越接近 1 越相似）
+    double sim12 = cosineSimilarity(vectors.get(0), vectors.get(1));
+    double sim13 = cosineSimilarity(vectors.get(0), vectors.get(2));
+    double sim23 = cosineSimilarity(vectors.get(1), vectors.get(2));
+
+    return new SimilarityResult(
+            text1, text2, text3,
+            vectors.get(0).length,  // 向量维度（2048），用来确认配置是否生效
+            sim12, sim13, sim23);
+}
+
+// 余弦相似度：cos = (a·b) / (|a| * |b|)
+private double cosineSimilarity(float[] a, float[] b) {
+    double dot = 0.0, normA = 0.0, normB = 0.0;
+    for (int i = 0; i < a.length; i++) {
+        dot += a[i] * b[i];       // 点积
+        normA += a[i] * a[i];     // a 的长度的平方
+        normB += b[i] * b[i];     // b 的长度的平方
+    }
+    return dot / (Math.sqrt(normA) * Math.sqrt(normB));
+}
+```
+
+说明：
+
+- `embeddingModel.embed(List.of(...))` 一次传入多条文本，返回多个向量，顺序与输入一致。
+- `cosineSimilarity(...)` 是手写的余弦相似度计算，公式为 `cos = (a·b) / (|a| * |b|)`，用来衡量两个向量方向上的接近程度。
+
+---
+
+## 五、运行与测试
+
+启动应用后，浏览器或命令行访问：
+
+```text
+http://localhost:8080/ai/embedding/similarity
+```
+
+返回结果示例（数值随模型输出略有浮动）：
+
+```json
+{
+  "text1": "我喜欢吃苹果",
+  "text2": "苹果是我最喜欢的水果",
+  "text3": "今天天气很好",
+  "dimension": 2048,
+  "text1Text2Similarity": 0.87,
+  "text1Text3Similarity": 0.31,
+  "text2Text3Similarity": 0.29
+}
+```
+
+观察规律：
+
+- `text1Text2Similarity`（两句都谈“苹果”）明显较高（例如 0.8+）。
+- `text1Text3Similarity`、`text2Text3Similarity`（一句“苹果” vs 一句“天气”）明显较低（例如 0.3 左右）。
+
+也可以用自定义文本测试：
+
+```text
+http://localhost:8080/ai/embedding/similarity?text1=我喜欢打篮球&text2=篮球是我最爱的运动&text3=今天要下雨
+```
+
+---
+
+## 六、实现原理
+
+### 6.1 文本是如何变成向量的？
+
+嵌入模型内部是一个深度神经网络。简化理解：
+
+```text
+"我喜欢吃苹果"
+   ↓
+分词（把句子拆成 token）
+   ↓
+神经网络逐层计算，逐步提取语义特征
+   ↓
+输出一个定长向量（2048 个数字）
+```
+
+这个向量不是随便生成的，而是模型在大量文本上训练出来的：训练时让“语义相近的句子”向量靠得更近、让“语义无关的句子”向量离得更远。因此向量天然携带了语义信息。
+
+### 6.2 余弦相似度：衡量“方向”而非“距离”
+
+两个向量 a、b 的余弦相似度：
+
+```text
+cos(θ) = (a · b) / (|a| * |b|)
+
+其中：
+  a · b  = a1*b1 + a2*b2 + ... + a2048*b2048   （点积）
+  |a|    = sqrt(a1² + a2² + ... + a2048²)       （向量长度）
+```
+
+- 当两个向量方向完全一致，`cos = 1`（最相似）。
+- 当两个向量相互垂直，`cos = 0`（无关）。
+- 当两个向量方向完全相反，`cos = -1`（对 embedding 场景很少见）。
+
+所以 `cos` 越接近 1，两句语义越相近；“距离”可表示为 `1 - cos`，越大表示离得越远。
+
+### 6.3 EmbeddingModel 抽象
+
+和 `ChatModel`、`ChatClient` 一样，`EmbeddingModel` 是 Spring AI 的统一抽象：
+
+| 方法 | 作用 |
+|---|---|
+| `embed(String text)` | 把单个文本转成 `float[]` |
+| `embed(List<String> texts)` | 批量把多个文本转成 `List<float[]>` |
+| `embedForResponse(List<String>)` | 返回更完整的 `EmbeddingResponse`（含元数据） |
+| `dimensions()` | 返回该模型的向量维度 |
+
+得益于这个抽象，将来换一个嵌入模型（如 OpenAI 的 `text-embedding-3-small`），**业务代码完全不用改**，只改配置即可。
+
+---
+
+## 七、核心 API 总结
+
+| 功能 | 核心 API                                   | 作用                     |
+|---|------------------------------------------|------------------------|
+| 注入嵌入模型 | 构造器注入 `EmbeddingModel`                   | 获得嵌入模型的统一抽象            |
+| 文本向量化 | `embeddingModel.embed(List.of(a, b, c))` | 把多条文本转成 `List<float[]>` |
+| 余弦相似度 | `dot / (abs(a) * abs(b))`                | 衡量两个向量方向的接近程度 |
+
+通过 v0.5，我们学会了把文本“翻译”成机器能算的数字向量，并用余弦相似度比较语义远近。这是**语义搜索、RAG（检索增强生成）、向量数据库**这些进阶能力的基础——下一步自然就可以把向量存进向量数据库做检索了。
+
+---
+
 **版本记录**
 
 - v0.1：基础大模型调用，使用 `ChatClient` 完成普通问答。
 - v0.2：流式输出、System Prompt、提示词模板参数、结构化输出。
 - v0.3：工具调用（Tool Calling），@Tool 注解与 FunctionToolCallback 两种定义方式，以及实现机制。
 - v0.4：对话记忆（Chat Memory 窗口），MessageWindowChatMemory + MessageChatMemoryAdvisor，以及实现原理。
+- v0.5：嵌入模型（Embedding），text-embedding-v4（2048 维）+ 余弦相似度，以及实现原理。

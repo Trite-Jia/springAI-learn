@@ -13,6 +13,16 @@ spring:
         model: deepseek-flash  # 模型名称
         temperature: 0.7  # 值越大，输出的结果越随机
 
+      # 嵌入模型（Embedding）配置：
+      # 这里使用阿里云百炼（DashScope）的 text-embedding-v4 模型，
+      # 通过百炼提供的 OpenAI 兼容接口访问。
+      # 注意：chat（对话）与 embedding（嵌入）是两个独立的模型，可以指向不同的服务商。
+      embedding:
+        base-url: https://ws-4o6upfc7wwd9twv8.cn-beijing.maas.aliyuncs.com/compatible-mode/v1  # 百炼 OpenAI 兼容接口
+        api-key: ${DASHSCOPE_API_KEY}  # 百炼 API Key，替换成你自己的
+        model: qwen3.7-text-embedding  # 嵌入模型名称
+        dimensions: 2048  # 向量维度（text-embedding-v4 支持 2048/1536/1024/768/512/256/128/64）
+
     # 启用相关自动配置，通常会自动提供 ChatClient.Builder，供你构建 ChatClient
     chat:
       client:
